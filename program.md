@@ -181,20 +181,91 @@ LOOP FOREVER:
 8. If val_bpb improved (lower), keep the commit.
 9. If val_bpb is equal or worse, `git reset --hard HEAD~1` to revert.
 
-## Ideas to explore
+## Strategy: Balancing Exploration and Exploitation
 
-Based on the current leaderboard (see `records/track_10min_16mb/`), promising directions include:
+Use this rough ratio: **60% exploitation, 40% exploration**. Alternate between them — don't do 10 exploitation runs in a row.
 
-- **Model scaling**: Try different depth/width ratios (more layers at narrower width, or fewer layers at wider width)
-- **Learning rates**: Tune embed_lr, matrix_lr, scalar_lr, head_lr independently
-- **Optimizer**: Muon momentum, backend steps, warmup schedule
-- **Architecture**: GQA ratios, MLP expansion factor, different activation functions
-- **Quantization**: Improve int8 quantization (per-channel vs per-tensor, clip percentiles)
-- **Training dynamics**: Batch size, sequence length, warmdown schedule, gradient clipping
-- **Advanced techniques from leaderboard**: Mixed-precision quantization (int5/int6), BigramHash embeddings, value residuals, sliding window attention, stochastic weight averaging
+### Exploitation (proven techniques — implement and tune)
+
+These techniques have demonstrated impact on the leaderboard. Apply them incrementally, stacking gains:
+
+**Tier 1 — Highest impact, implement first:**
+1. **Sliding window eval (stride=64)** — ~0.034 bpb free improvement. Every top entry uses this. Just changes eval, no training cost.
+2. **3x MLP expansion** (hidden=1536) — ~0.019 bpb. Standard in top 6. Increases params but fits in budget.
+3. **Int6 QAT with STE** — eliminates the ~0.007 quantization gap entirely. Straight-through estimator during training.
+4. **10 layers (vs 9)** — ~0.015 bpb. Top 5 all use 10+. Slightly slower per step but worth it.
+5. **seq_len=2048** — ~0.018 bpb. Longer context helps. Halves steps/sec but improves quality.
+
+**Tier 2 — Moderate impact, stack on top:**
+6. **Muon WD=0.04, momentum=0.99** with warmup from 0.92 over 1500 steps — ~0.010 bpb.
+7. **SmearGate** — learned gate blending current token with previous token embedding. ~0.005-0.010 bpb.
+8. **BigramHash embeddings** (4096-10240 buckets, dim=128) — captures bigram statistics. ~0.001-0.005 bpb.
+9. **FP16 tied embedding export** — keeps embedding precision high while quantizing everything else.
+10. **Orthogonal weight initialization** — small but consistent gain across top entries.
+
+**Tier 3 — Marginal but free:**
+11. **SWA** (stochastic weight averaging) over last 40-50% of training, every 50 steps — ~0.001 bpb.
+12. **grad_clip_norm=0.3** — stabilizes training with aggressive LR.
+13. **zstd-22 compression** (vs zlib) — better compression ratio, fits more params in 16MB.
+14. **U-Net skip connections** — residual connections across layer pairs.
+15. **Lower learning rates** (matrix_lr=0.02, tied_embed_lr=0.03) when using momentum=0.99.
+
+### Exploration (novel ideas — high variance, high potential)
+
+These are untested or underexplored. Try them boldly. Most will fail — that's fine.
+
+**Architecture exploration:**
+- **Mixture of Experts (MoE)** — 2-4 experts per layer with top-1 routing. More params at same inference cost. Could dramatically increase effective model capacity within the size budget.
+- **Deeper + narrower** — 12-14 layers at 384-448 dim instead of 10 at 512. Different depth/width tradeoff.
+- **Shared layers / parameter tying** — repeat the same 5-layer block twice. Halves unique params, could allow wider models.
+- **Hybrid attention** — mix local sliding window attention with full attention every N layers.
+- **Multi-scale architecture** — different head dimensions or MLP sizes per layer.
+
+**Quantization exploration:**
+- **Int4 for select layers** — nobody's gone below int5 yet. If middle layers are less sensitive, int4 could free up bytes for more params.
+- **Learned quantization grids** — instead of uniform int6, learn optimal bucket boundaries per layer.
+- **Mixed int4/int5/int6** — finer-grained precision allocation based on layer sensitivity.
+- **Pruning + quantization** — structured pruning (remove attention heads or MLP neurons) combined with lower-bit quant.
+
+**Training exploration:**
+- **Knowledge distillation** — train a larger teacher model for 5 min, then distill to student for 5 min. Split the time budget.
+- **Progressive growing** — start with 6 layers, add layers during training. Warm-start deeper models.
+- **Curriculum learning** — train on shorter sequences first, then increase seq_len mid-training.
+- **Lion or SOAP optimizer** — alternatives to Muon that might work better at this scale.
+- **Cyclic learning rates** — cosine restarts instead of linear warmdown.
+
+**Embedding exploration:**
+- **Factored embeddings** — decompose the 1024×512 embedding into 1024×64 × 64×512. Tiny vocab = opportunity.
+- **Byte-level auxiliary loss** — add a character-level prediction head to enrich representations.
+- **Positional encoding alternatives** — ALiBi, learned positions, or NoPE (no positional encoding).
+
+**Eval-time exploration:**
+- **LoRA test-time training** — adapt at eval time with per-document LoRA (samacqua got -0.003 bpb from this).
+- **Ensemble at eval** — SWA over multiple checkpoints with different averaging weights.
+- **Beam search / sampling tricks** — not applicable to BPB directly, but eval methodology matters.
+
+### How to pick the next experiment
+
+1. **If the last experiment improved**: try a small variant of it (exploitation). Tune the hyperparameter further, or combine with another Tier 1 technique.
+2. **If the last 2-3 experiments failed**: switch modes. If you were exploiting, try an exploration idea. If exploring, go back to proven techniques.
+3. **If you've stacked all Tier 1 techniques**: focus on Tier 2, and increase exploration ratio to 50/50.
+4. **If you're stuck (5+ failures in a row)**: do something radical — try a completely different architecture or combine 2-3 exploration ideas at once.
+5. **Read `records/` for inspiration**: detailed submission notes often contain failed experiments that were close to working.
+
+### Current leaderboard context
+
+**SOTA: 1.1428** (thwu1) — 10L, 512d, int5-MLP + int6-attn, BigramHash(10240), SWA, SmearGate, OrthoInit, U-Net skips, Muon WD=0.04.
+
+**Baseline: 1.2244** — 9L, 512d, int8, default hyperparams.
+
+**Your target**: beat 1.1428 or get as close as possible. Every 0.001 bpb matters.
+
+## Practical notes
 
 **Timeout**: Each experiment should take at most ~10 minutes for full runs, or ~2 minutes for quick iteration. If a run exceeds 15 minutes, kill it and treat it as a failure.
 
 **Crashes**: If a run crashes (OOM, bug, etc.), use your judgment: fix simple issues and re-run, or skip broken ideas.
+
+**Syncing changes**: When modifying `train_gpt.py`, keep `train_gpt_mlx.py` in sync if the change is architecture-related. For PyTorch-specific optimizations (CUDA kernels, torch.compile), those only go in `train_gpt.py`.
 
 **NEVER STOP**: Once the experiment loop has begun, do NOT pause to ask the human if you should continue. The human might be asleep. You are autonomous. If you run out of ideas, think harder — read the leaderboard submissions in `records/`, re-read the training script for new angles, try combining previous near-misses, try more radical changes. The loop runs until the human interrupts you.
